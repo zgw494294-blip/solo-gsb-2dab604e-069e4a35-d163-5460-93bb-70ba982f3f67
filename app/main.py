@@ -8,6 +8,10 @@ POST /infer-dimensions 接收多条乘积等式 {"equations": [...]}，推断未
 
 POST /dimensionless-group 接收 1～8 个具名量 {"quantities": [{name, unit}]}，
 搜索每项 ∈ [-6, 6] 的最简无量纲乘积指数；无解或输入非法返回 422。
+
+POST /propagate-product 接收 1～8 个测量因子 {"factors": [{value, uncertainty,
+unit, power?}], "to": "..."}，计算 y=∏x_i^power 及其一阶合成标准不确定度；
+零值负幂、°C/°F、目标量纲不符等返回 422。
 """
 
 from fastapi import FastAPI, HTTPException
@@ -33,13 +37,19 @@ from .dimensions import (
     infer_dimensions,
     parse_unit_dimensions,
 )
+from .propagate import (
+    ProductFactorInput,
+    ProductUnitError,
+    PropagationError,
+    propagate_product,
+)
 
 app = FastAPI(
     title="Unit Converter API",
-    version="1.2.0",
+    version="1.3.0",
     description="长度 / 质量 / 时间 / 温度四维量纲的单位换算，"
-                "支持复合单位表达式、°C / °F 偏移温标、量纲推断"
-                "与最简无量纲乘积搜索。",
+                "支持复合单位表达式、°C / °F 偏移温标、量纲推断、"
+                "最简无量纲乘积搜索与乘积不确定度传播。",
 )
 
 
@@ -123,6 +133,30 @@ class DimensionlessGroupRequest(BaseModel):
 
 class DimensionlessGroupResponse(BaseModel):
     exponents: dict[str, int]
+
+
+class ProductFactorModel(BaseModel):
+    """一个测量因子：value/uncertainty 为有限十进制字符串，power ∈ [-6, 6]，默认 1。"""
+    model_config = ConfigDict(extra="forbid")
+
+    value: str = Field(max_length=10_000, description="有限十进制字符串")
+    uncertainty: str = Field(max_length=10_000,
+                             description="有限十进制字符串，非负")
+    unit: str = Field(min_length=1, max_length=2_000, description="单位表达式")
+    power: int = Field(default=1, ge=-6, le=6)
+
+
+class PropagateProductRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    factors: list[ProductFactorModel] = Field(min_length=1, max_length=8)
+    to: str = Field(min_length=1, max_length=2_000,
+                    description='目标单位表达式；"1" 表示无量纲')
+
+
+class PropagateProductResponse(BaseModel):
+    value: str
+    uncertainty: str
 
 
 def _unprocessable(error: str, message: str, **extra) -> HTTPException:
@@ -216,6 +250,28 @@ def dimensionless_group_endpoint(
 
     return DimensionlessGroupResponse(exponents={
         name: exponent for (name, _), exponent in zip(parsed, exponents)})
+
+
+@app.post("/propagate-product", response_model=PropagateProductResponse)
+def propagate_product_endpoint(
+        req: PropagateProductRequest) -> PropagateProductResponse:
+    factors = [
+        ProductFactorInput(value=f.value, uncertainty=f.uncertainty,
+                           unit=f.unit, power=f.power)
+        for f in req.factors
+    ]
+    try:
+        y, u = propagate_product(factors, req.to)
+    except ProductUnitError as exc:
+        extra: dict = {"factor": exc.factor} if exc.factor is not None \
+            else {"field": "to"}
+        if exc.position is not None:
+            extra["position"] = exc.position
+        raise _unprocessable(exc.kind, exc.message, **extra)
+    except PropagationError as exc:
+        raise _unprocessable(exc.error, exc.message, **exc.extra)
+    return PropagateProductResponse(
+        value=format_result(y), uncertainty=format_result(u))
 
 
 @app.get("/health")
