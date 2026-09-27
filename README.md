@@ -2,7 +2,8 @@
 
 基于 **Python + FastAPI + Decimal/Fraction** 的工程单位换算服务。
 支持长度、质量、时间、温度四维量纲核对，复合单位表达式，°C / °F 偏移温标换算，
-由多条乘积等式推断未知变量的四维量纲，以及从具名量中搜索最简无量纲乘积。
+由多条乘积等式推断未知变量的四维量纲，从具名量中搜索最简无量纲乘积，
+以及独立测量值乘积的一阶合成标准不确定度传播。
 
 ## 启动（单条命令）
 
@@ -127,6 +128,46 @@ curl -X POST http://localhost:8000/dimensionless-group \
 # {"exponents":{"L":1,"mu":-1,"rho":1,"v":1}}
 ```
 
+### POST /propagate-product
+
+计算 **1～8 个**独立测量值的乘积及其**一阶合成标准不确定度**。请求体
+`factors` 为 `{value, uncertainty, unit, power}` 数组：`value`、
+`uncertainty` 为有限十进制字符串（`uncertainty` 非负），`unit` 为单位
+表达式（不接受 `°C` / `°F`），`power` 为 **-6～6 的整数**（默认 1）；
+`to` 为目标单位表达式，`to="1"` 仅表示无量纲：
+
+```json
+{
+  "factors": [
+    {"value": "2", "uncertainty": "0.1", "unit": "m"},
+    {"value": "3", "uncertainty": "0.2", "unit": "m"}
+  ],
+  "to": "m^2"
+}
+```
+
+响应（`value`、`uncertainty` 均为字符串）：
+
+```json
+{"value": "6", "uncertainty": "0.5"}
+```
+
+计算规则：先把每个因子的值与不确定度按单位比例换算到基本单位，求
+`y = ∏ x_i^power`（**零值的零次幂按 1**）与
+`u = √Σ[(∂y/∂x_i · u_i)²]`，其中导数按乘积计算
+`∂y/∂x_i = power_i · x_i^(power_i − 1) · ∏_{j≠i} x_j^power_j`；
+再把 `y`、`u` 换算到 `to`。中间值用有理数精确累计，平方根按
+**ROUND_HALF_EVEN** 保留最多 **12 位小数**。
+
+**零值取负幂**、目标量纲与乘积量纲不符、使用 `°C` / `°F` 均返回 422。
+
+```bash
+curl -X POST http://localhost:8000/propagate-product \
+  -H 'Content-Type: application/json' \
+  -d '{"factors":[{"value":"2","uncertainty":"0.1","unit":"m"},{"value":"3","uncertainty":"0.2","unit":"m"}],"to":"m^2"}'
+# {"value":"6","uncertainty":"0.5"}
+```
+
 ## 单位与表达式语法
 
 - 支持单位：`m`、`km`、`cm`、`mm`（长度）；`kg`、`g`（质量）；`s`、`min`、`h`（时间）；`K`、`°C`、`°F`（温度）。
@@ -161,8 +202,10 @@ curl -X POST http://localhost:8000/dimensionless-group \
 | `inconsistent_constraints` | 约束互相矛盾（如同一变量同时被约束为 `m` 与 `s`），含首个矛盾维度 `dimension` |
 | `underdetermined` | 约束不足，存在无法唯一确定的变量，含 `free_variables` 列表 |
 | `fractional_dimensions` | 解唯一但含分数指数（如 `x^2 = m`），含相关 `variables` 列表 |
-| `offset_temperature_not_allowed` | `/infer-dimensions` 的单位因子使用了 °C / °F；含 `equation`、`side`、`factor` 坐标（及单位表达式内 `position`） |
+| `offset_temperature_not_allowed` | `/infer-dimensions` 的单位因子或 `/propagate-product` 的单位使用了 °C / °F；含坐标（及单位表达式内 `position`） |
 | `no_dimensionless_group` | `/dimensionless-group` 在 -6～6 指数范围内不存在非平凡无量纲组合 |
+| `invalid_uncertainty` | `/propagate-product` 因子的 `uncertainty` 不是有限十进制字符串或为负，含 `factor` |
+| `zero_negative_power` | `/propagate-product` 的零值因子取了负幂，含 `factor` |
 
 `/infer-dimensions` 的单位因子语法错误同样返回 `syntax_error`，并带
 `equation`（等式下标）、`side`（`left`/`right`）、`factor`（因子下标）
@@ -172,6 +215,12 @@ curl -X POST http://localhost:8000/dimensionless-group \
 `offset_temperature_not_allowed`，坐标字段为 `quantity`（量在
 `quantities` 中的下标）与 0 起始的 `position`；`name` 空白或重复、
 `quantities` 数量不在 1～8 等请求体问题由 FastAPI 校验返回 422。
+
+`/propagate-product` 的单位错误同样返回 `syntax_error` /
+`offset_temperature_not_allowed`，坐标字段为 `factor`（因子下标）或
+`field: "to"`（目标单位）与 0 起始的 `position`；`invalid_value` /
+`invalid_uncertainty` / `zero_negative_power` 均带 `factor`；
+`factors` 数量不在 1～8、`power` 越界等请求体问题由 FastAPI 校验返回 422。
 
 请求体缺字段、类型错误等由 FastAPI 校验，同样返回 422。
 
@@ -187,10 +236,11 @@ uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-  converter.py      # 词法/语法分析、量纲核对、有理数换算、ROUND_HALF_EVEN 格式化
+  converter.py      # 词法/语法分析、量纲核对、有理数换算、ROUND_HALF_EVEN 格式化（含方差开方）
   dimensions.py     # 跨等式线性约束（有理 Gauss-Jordan 消元）与四维量纲推断
   dimensionless.py  # 最简无量纲乘积搜索（中途相遇枚举 ±6 整数指数）
-  main.py           # FastAPI 应用（POST /convert、/infer-dimensions、/dimensionless-group、GET /health）
+  propagation.py    # 独立测量值乘积的一阶合成标准不确定度传播
+  main.py           # FastAPI 应用（POST /convert、/infer-dimensions、/dimensionless-group、/propagate-product、GET /health）
 tests/              # pytest 测试（核心逻辑 + HTTP API）
 Dockerfile
 docker-compose.yml

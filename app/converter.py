@@ -16,6 +16,7 @@ import sys
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
+from math import isqrt
 
 # Python 3.11+ 对 int->str 有 4300 位上限；换算结果可能更长，提前放宽。
 if hasattr(sys, "set_int_max_str_digits"):
@@ -332,6 +333,22 @@ def convert(value_raw: str, from_expr: str, to_expr: str) -> str:
 MAX_DECIMALS = 12
 
 
+def _format_scaled(q: int) -> str:
+    """把 q（= 真值 × 10^MAX_DECIMALS 的整数）格式化为十进制字符串。
+
+    去掉末尾零，最后经 Decimal 规范化输出。
+    """
+    if q == 0:
+        return "0"
+    negative = q < 0
+    digits = str(abs(q)).rjust(MAX_DECIMALS + 1, "0")
+    int_part = digits[:-MAX_DECIMALS]
+    frac_part = digits[-MAX_DECIMALS:].rstrip("0")
+    text = int_part if not frac_part else f"{int_part}.{frac_part}"
+    text = format(Decimal(text), "f")
+    return f"-{text}" if negative else text
+
+
 def format_result(value: Fraction) -> str:
     """按 ROUND_HALF_EVEN 保留最多 12 位小数并去掉末尾零。
 
@@ -340,17 +357,31 @@ def format_result(value: Fraction) -> str:
     规范化输出。
     """
     num, den = value.numerator, value.denominator
-    negative = num < 0
-    num = abs(num)
-    q, r = divmod(num * 10 ** MAX_DECIMALS, den)
+    q, r = divmod(abs(num) * 10 ** MAX_DECIMALS, den)
     twice = r * 2
     if twice > den or (twice == den and q % 2 == 1):
         q += 1
-    if q == 0:
-        return "0"
-    digits = str(q).rjust(MAX_DECIMALS + 1, "0")
-    int_part = digits[:-MAX_DECIMALS]
-    frac_part = digits[-MAX_DECIMALS:].rstrip("0")
-    text = int_part if not frac_part else f"{int_part}.{frac_part}"
-    text = format(Decimal(text), "f")
-    return f"-{text}" if negative else text
+    return _format_scaled(-q if num < 0 else q)
+
+
+def format_uncertainty(variance: Fraction) -> str:
+    """把非负方差开方后按 ROUND_HALF_EVEN 保留最多 12 位小数并去掉末尾零。
+
+    全程整数算术：round(√(n/d) · 10^12) = round_half_even(√(n·10^24/d))。
+    记 scaled = n·10^24、root = ⌊√(scaled/d)⌋，则真实平方根超过
+    root + 1/2 当且仅当 4·scaled > (2·root+1)²·d；相等时恰为平局，
+    按 ROUND_HALF_EVEN 向偶数进位。
+    """
+    if variance < 0:
+        raise ValueError("variance must be non-negative")
+    n, d = variance.numerator, variance.denominator
+    scaled = n * 10 ** (2 * MAX_DECIMALS)
+    q, r = divmod(scaled, d)
+    root = isqrt(q)
+    if r == 0 and root * root == q:
+        return _format_scaled(root)  # 完全平方，无舍入
+    lhs = 4 * scaled
+    rhs = (2 * root + 1) ** 2 * d
+    if lhs > rhs or (lhs == rhs and root % 2 == 1):
+        root += 1
+    return _format_scaled(root)
